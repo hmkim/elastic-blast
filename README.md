@@ -116,6 +116,27 @@ bash elastic-blast/bin/aws-describe-elastic-blast-janitor-role.sh
 
 저장소를 클론하는 실제 이유는 이 스크립트입니다. ElasticBLAST는 `submit` 시 janitor 역할이 있는지 확인하고, **없으면 오류 없이(debug 로그만 남기고) 자동 정리를 비활성화**합니다. 그 상태로 `elastic-blast delete`를 잊으면 인스턴스가 계속 과금되므로 처음 사용하는 계정에서는 반드시 한 번 실행하십시오.
 
+### 1.4 EC2 vCPU 쿼터 확인
+
+ElasticBLAST는 `num-nodes` x 인스턴스 vCPU 만큼의 온디맨드 vCPU 쿼터가 필요합니다. 이 가이드의 구성(r5d.24xlarge 96 vCPU x 4노드)은 **384 vCPU**입니다. 쿼터가 부족하면 오류가 나지 않고 Batch 잡이 `PENDING`(status 출력의 `Pending`) 상태로 무한히 대기하므로 제출 전에 확인합니다.
+
+```bash
+# Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances 쿼터 (단위: vCPU)
+aws service-quotas get-service-quota \
+  --service-code ec2 \
+  --quota-code L-1216C47A \
+  --query Quota.Value --output text --region us-east-1
+```
+
+결과가 `num-nodes x vCPU`(예: 4 x 96 = 384) 이상이어야 합니다. 부족하면 같은 쿼터 코드로 증가를 요청하십시오.
+
+```bash
+aws service-quotas request-service-quota-increase \
+  --service-code ec2 --quota-code L-1216C47A --desired-value 384 --region us-east-1
+```
+
+`x1.32xlarge`는 128 vCPU이지만 X 패밀리는 다른 쿼터(`L-7295265B`, Running On-Demand X instances)에 속하므로, nt 유지 구성을 쓸 때는 그 코드를 확인하십시오.
+
 ---
 
 ## 2단계: 데이터 준비
@@ -141,12 +162,15 @@ ls -lh data/query.fasta        # 파일 크기
 
 ### 2.2 S3 버킷 생성
 
+버킷 이름은 전 세계에서 고유해야 하므로 `elasticblast` 같은 짧은 이름은 이미 사용 중일 가능성이 높습니다. `elasticblast-<계정 ID>` 형식을 권장합니다. 이 문서의 나머지 예시는 `s3://elasticblast`로 표기하므로 자신의 버킷 이름으로 바꿔 읽으십시오.
+
 ```bash
 # S3 버킷 생성 (버킷 이름은 전역적으로 고유해야 함)
-aws s3 mb s3://elasticblast --region us-east-1
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+aws s3 mb s3://elasticblast-${ACCOUNT_ID} --region us-east-1
 
 # 버킷 확인
-aws s3 ls s3://elasticblast
+aws s3 ls s3://elasticblast-${ACCOUNT_ID}
 ```
 
 ### 2.3 쿼리 파일 S3 업로드
@@ -204,31 +228,37 @@ aws-region = us-east-1
 [cluster]
 num-nodes = 4
 machine-type = r5d.24xlarge
-labels = owner=hyunmin
+labels = Owner=<your-name>,Project=BLAST
 
 [blast]
 program = blastn
 db = nt
 queries = s3://elasticblast/queries/query.fasta
-results = s3://elasticblast/results/nt-test
+results = s3://elasticblast/results/nt-20251217-1
 options = -evalue 1.0E-3 -max_target_seqs 5 -outfmt '6 qseqid qstart qend qcovs qcovhsp qcovus sseqid stitle sstart send evalue bitscore nident pident mismatch gaps sstrand staxids sscinames'
 ```
+
+> `machine-type = r5d.24xlarge`, `db = nt`는 2025-12 실행 당시 구성입니다. 현재 nt 크기에서는 [인스턴스 타입 선택 가이드](#인스턴스-타입-선택-가이드)에 따라 `x1.32xlarge` 또는 `db = core_nt` + `r5d.12xlarge`로 바꿔야 합니다.
 
 ### 4.2 설정 파일 설명
 
 #### [cloud-provider] 섹션
-- `aws-region`: AWS 리전 (us-east-1 권장 - NCBI 데이터베이스와 동일 리전)
+- `aws-region`: AWS 리전 (us-east-1 권장 - NCBI 데이터베이스와 동일 리전. 근거는 [리전 선택](#리전-선택) 참고)
 
 #### [cluster] 섹션
 - `num-nodes`: 워커 노드 수 (4개 = 병렬 처리 4개)
 - `machine-type`: EC2 인스턴스 타입 (r5d.24xlarge = 768GB 메모리. 2025-12 실행 당시 nt에 맞는 최소 사양이었으나 **현재 nt는 768GB에 들어가지 않습니다** -- 아래 [인스턴스 타입 선택 가이드](#인스턴스-타입-선택-가이드) 참고)
-- `labels`: 리소스 태그 (비용 추적 및 관리용)
+- `labels`: 리소스 태그 (비용 추적 및 관리용). 쉼표로 구분한 `키=값` 목록
+  - ElasticBLAST는 기본으로 `Project=elastic-blast`, `Owner=<실행 사용자>`, `Name`, `billingcode=elastic-blast` 등의 태그를 붙입니다. 같은 키를 `labels`에 쓰면 기본값을 덮어씁니다
+  - 키는 **대소문자를 구분**합니다. `Owner=`(대문자)는 기본 Owner 태그를 덮어쓰지만, `owner=`(소문자)는 별도 태그로 추가되어 Owner가 두 개 생깁니다
+  - `Project=BLAST`처럼 조직에서 이미 비용 할당 태그로 활성화한 키를 넣으면 Cost Explorer에서 바로 비용을 묶어 볼 수 있습니다 ([비용 추적](#비용-추적) 참고)
 
 #### [blast] 섹션
 - `program`: BLAST 프로그램 (blastn, blastp, blastx 등)
 - `db`: 데이터베이스 이름 (nt = NCBI Nucleotide database)
 - `queries`: S3에 업로드된 쿼리 파일 경로
 - `results`: 결과를 저장할 S3 경로
+  - **실행마다 새 접두어**를 쓰십시오(예: `results/nt-<YYYYMMDD>-<n>`). 이전 실행의 `metadata/job-ids-v2.json`이 남아 있는 접두어로는 `submit`이 거부됩니다
 - `options`: BLAST 실행 옵션
   - `-evalue 1.0E-3`: E-value 임계값
   - `-max_target_seqs 5`: 최대 5개 매치 결과
@@ -263,7 +293,7 @@ ElasticBLAST는 항상 `s3://ncbi-blast-databases/latest-dir`가 가리키는 �
 
 ```bash
 # 결과 경로 (설정 파일의 results와 동일)
-export YOUR_RESULTS_BUCKET=s3://elasticblast/results/nt-test
+export YOUR_RESULTS_BUCKET=s3://elasticblast/results/nt-20251217-1
 
 # DB 디렉터리(날짜)와 메타데이터의 last-updated 기록
 LATEST_DIR=$(aws s3 cp s3://ncbi-blast-databases/latest-dir -)
@@ -300,21 +330,30 @@ WARNING: Using gp3 30GB EBS root disk because locally attached SSDs will be used
 ### 5.3 진행 상황 모니터링
 
 ```bash
-# 상태 확인
+# 상태 확인 (1회)
 elastic-blast status --cfg elasticblast-config.ini
+
+# 완료까지 대기 (20초 간격 폴링) + 종료 코드로 결과 반환 (0 = 성공, 1 = 실패)
+elastic-blast status --cfg elasticblast-config.ini --wait --exit-code \
+  && echo "BLAST 성공" || echo "BLAST 실패"
 ```
 
-**상태 변화:**
-1. `SUBMITTING`: 클라우드 리소스 생성 중
-2. `RUNNING`: BLAST 작업 실행 중 (배치별 진행 상황 표시)
-3. `SUCCEEDED`: 모든 작업 완료
+**상태 값:**
+1. `CREATING`: 클라우드 리소스 생성 중
+2. `SUBMITTING`: 잡 제출 중
+3. `RUNNING`: BLAST 작업 실행 중 (배치별 진행 상황 표시)
+4. `SUCCESS`: 모든 작업 완료 / `FAILURE`: 실패
+5. `DELETING`: 리소스 삭제 중
 
-**실행 중 출력 예시:**
+**실행 중 출력 예시** (`RUNNING` 상태에서는 상태 문자열 대신 배치 수 4줄이 출력됩니다):
 ```
-ElasticBLAST search: elasticblast-abc123
-Status: RUNNING
-Batches: 10 total, 7 succeeded, 3 running, 0 failed
+Pending 12
+Running 10
+Succeeded 3
+Failed 0
 ```
+
+완료되면 `Your ElasticBLAST search succeeded, results can be found in s3://...` 가 출력됩니다. `--exit-code`의 종료 코드는 상태 값과 1:1로 대응합니다(SUCCESS 0, FAILURE 1, CREATING 2, SUBMITTING 3, RUNNING 4, DELETING 5, UNKNOWN 6).
 
 ### 5.4 실행 과정
 
@@ -356,7 +395,7 @@ ElasticBLAST는 다음 단계를 자동으로 수행합니다:
 
 ```bash
 # 결과 경로 환경 변수 설정
-export YOUR_RESULTS_BUCKET=s3://elasticblast/results/nt-test
+export YOUR_RESULTS_BUCKET=s3://elasticblast/results/nt-20251217-1
 
 # 결과 파일 다운로드 (.out.gz 파일만)
 aws s3 cp ${YOUR_RESULTS_BUCKET}/ . --exclude "*" --include "*.out.gz" --recursive
@@ -489,6 +528,7 @@ aws s3 rb s3://elasticblast
 4. **데이터 전송**
    - NCBI S3 → EC2 (동일 리전): 무료
    - EC2 → S3 (동일 리전): 무료
+   - 다른 리전(예: 서울)에서 실행하면 NCBI S3 → EC2 교차 리전 전송 요금이 **노드마다** 발생합니다 ([리전 선택](#리전-선택) 참고)
 
 **총 실제 비용: 약 $11.5** (500개 쿼리, 4개 노드, 24분 기준)
 
@@ -549,6 +589,56 @@ us-east-1 Linux 온디맨드 단가 (2026-10 기준, 변동 가능):
 2. **노드 수 조정**: 대량 쿼리가 아니면 4개 노드로 충분
 3. **즉시 정리**: 작업 완료 후 즉시 `elastic-blast delete` 실행
 4. **리전 선택**: us-east-1 사용 (NCBI 데이터베이스와 동일 리전)
+
+### 리전 선택
+
+NCBI 호스팅 DB(`s3://ncbi-blast-databases`)는 us-east-1에 있습니다. 서울(ap-northeast-2)에서 실행할 때와 비교하면 다음 세 가지 이유로 **nt 규모 작업은 us-east-1 유지가 유리**합니다 (2026-10 기준 단가).
+
+| 항목 | us-east-1 | 서울(ap-northeast-2) |
+|------|-----------|---------------------|
+| r5d.24xlarge 온디맨드 | $6.912/h | $8.304/h (약 +20%) |
+| r5d.12xlarge 온디맨드 | $3.456/h | $4.152/h (약 +20%) |
+| x1.32xlarge 온디맨드 | $13.338/h | $19.341/h (약 +45%) |
+| NCBI S3 → EC2 DB 다운로드 | 무료 (동일 리전) | 교차 리전 전송 약 1.2TB x $0.02/GB ≈ **$24/노드/실행** (4노드 ≈ $96) |
+| 자동 선택 후보 c5ad 패밀리 | 제공 | **미제공** (r5ad/m5ad는 4xlarge·24xlarge만) |
+
+- 교차 리전 전송 요금은 노드마다 DB를 받으므로 노드 수에 비례합니다. 500개 쿼리처럼 EC2 비용이 $11 수준인 작업에서는 전송 요금($96)이 컴퓨팅 비용보다 커집니다.
+- 쿼리 파일과 결과는 수 MB 수준이므로 로컬(한국)에서 us-east-1 버킷으로 올리고 내려받는 비용은 무시할 수 있습니다.
+- 데이터 소재지 요건으로 서울 실행이 필수라면, `nt_prok`/`nt_viruses` 같은 소형 DB를 쓰거나 DB를 서울 리전 버킷에 한 번 복사해 두는 방식을 검토하십시오.
+
+### 비용 추적
+
+ElasticBLAST는 모든 리소스에 `billingcode=elastic-blast` 태그를 붙이지만, **Cost Explorer에서는 비용 할당 태그로 활성화한 키만 보입니다.** 활성화하지 않으면 `billingcode`로 그룹화한 결과가 전부 공란으로 나옵니다.
+
+방법 1 -- `billingcode`를 비용 할당 태그로 활성화 (1단계에서 1회, 반영까지 최대 24시간):
+
+```bash
+aws ce update-cost-allocation-tags-status \
+  --cost-allocation-tags-status TagKey=billingcode,Status=Active
+
+# 활성 상태 확인
+aws ce list-cost-allocation-tags --status Active --query "CostAllocationTags[].TagKey"
+```
+
+방법 2 -- 조직에서 이미 활성화한 키를 `labels`에 넣기 (이 가이드의 설정 예시는 `Project=BLAST`):
+
+```ini
+[cluster]
+labels = Owner=<your-name>,Project=BLAST
+```
+
+실행 다음 날 이후 실비 확인 (Cost Explorer 집계는 약 24시간 지연):
+
+```bash
+aws ce get-cost-and-usage \
+  --time-period Start=2025-12-17,End=2025-12-18 \
+  --granularity DAILY \
+  --metrics UnblendedCost \
+  --filter '{"Tags":{"Key":"Project","Values":["BLAST"]}}' \
+  --group-by Type=DIMENSION,Key=INSTANCE_TYPE
+```
+
+`--filter`의 키를 `billingcode` / `elastic-blast`로 바꾸면 방법 1에도 같은 명령을 쓸 수 있습니다. 결과의 인스턴스 타입별 금액을 `run-summary.json`의 노드-시간과 대조하면 단가 x 시간이 맞는지 검증할 수 있습니다.
 
 ---
 
@@ -636,17 +726,20 @@ aws logs describe-log-groups --log-group-name-prefix /aws/batch
 - AWS Batch, EC2, S3, CloudFormation, IAM 권한 확인
 - 관리자에게 필요한 권한 요청
 
-#### 3. 인스턴스 제한 초과
+#### 3. 인스턴스 제한 초과 (잡이 `Pending`에서 멈춤)
 
-**원인**: EC2 인스턴스 vCPU 제한 초과
+**원인**: EC2 온디맨드 vCPU 쿼터 부족. 오류 메시지 없이 Batch 잡이 `PENDING` 상태로 계속 대기합니다
 
 **해결 방법**:
 ```bash
-# 현재 제한 확인
+# 현재 제한 확인 (단위: vCPU). num-nodes x 인스턴스 vCPU (예: 4 x 96 = 384) 이상이어야 함
 aws service-quotas get-service-quota \
   --service-code ec2 \
-  --quota-code L-1216C47A
+  --quota-code L-1216C47A \
+  --query Quota.Value --output text
 ```
+
+부족하면 [1.4 EC2 vCPU 쿼터 확인](#14-ec2-vcpu-쿼터-확인)의 증가 요청 명령을 실행하고, 승인 뒤 `elastic-blast delete` 후 새 `results` 접두어로 다시 제출하십시오.
 
 #### 4. 결과 파일이 없음
 
@@ -658,7 +751,7 @@ aws service-quotas get-service-quota \
 elastic-blast status --cfg elasticblast-config.ini
 
 # S3 결과 확인
-aws s3 ls s3://elasticblast/results/nt-test/
+aws s3 ls s3://elasticblast/results/nt-20251217-1/
 ```
 
 ### 로그 확인
@@ -697,17 +790,19 @@ cat elastic-blast.log
 - [ ] AWS CLI 설치 및 구성 완료
 - [ ] IAM 권한 확인 (Batch, EC2, S3, CloudFormation, IAM)
 - [ ] janitor 역할 생성 (`bin/aws-create-elastic-blast-janitor-role.sh`, 계정당 1회)
-- [ ] S3 버킷 생성 (`s3://elasticblast`)
+- [ ] EC2 vCPU 쿼터 확인 (`L-1216C47A` ≥ num-nodes x vCPU, 예: 384)
+- [ ] 비용 할당 태그 활성화 또는 `labels = Project=BLAST` 등 활성 키 지정
+- [ ] S3 버킷 생성 (`s3://elasticblast-<계정 ID>`)
 - [ ] 쿼리 파일 S3 업로드
 - [ ] ElasticBLAST 설치 (버전 1.5.0, Python 3.11 이상)
-- [ ] 설정 파일 작성 (`elasticblast-config.ini`)
+- [ ] 설정 파일 작성 (`elasticblast-config.ini`, `results`는 실행마다 새 접두어)
 - [ ] 현재 DB 크기에 맞는 `machine-type`·`db` 확인 ([인스턴스 타입 선택 가이드](#인스턴스-타입-선택-가이드))
 - [ ] 필요 시 `export BLAST_USAGE_REPORT=false`, EBS 기본 암호화, 프라이빗 서브넷 설정 ([보안](#보안))
 
 ### 실행 중
 - [ ] DB 버전·BLAST+ 버전 기록 (`db-version.txt`)
 - [ ] `elastic-blast submit` 실행
-- [ ] 상태 주기적 확인 (`elastic-blast status`)
+- [ ] 상태 주기적 확인 (`elastic-blast status --wait --exit-code`)
 - [ ] CloudWatch Logs 모니터링 (선택사항)
 
 ### 실행 후
@@ -716,6 +811,7 @@ cat elastic-blast.log
 - [ ] 실행 요약 저장 (`elastic-blast run-summary -o run-summary.json`) -- delete 전
 - [ ] **리소스 정리** (`elastic-blast delete`) ⚠️ 중요!
 - [ ] EC2 인스턴스 삭제 확인
+- [ ] 다음 날 Cost Explorer로 실비 확인 ([비용 추적](#비용-추적))
 - [ ] S3 버킷 정리 (선택사항)
 
 ---
@@ -733,6 +829,8 @@ cat elastic-blast.log
   - 인스턴스 타입 선택 가이드를 현재 nt 크기(1,117GiB, 캐시 1,089GiB, 요구 메모리 1,151GiB) 기준으로 재작성. 768GB급은 캐시 불가 → x1.32xlarge 또는 core_nt. 자동 선택 후보(m5ad/c5ad/r5ad)와 미지정 시 오류 문구 수록
   - 5.1 DB 버전·BLAST+ 버전 기록 단계, 6.5 `run-summary` 저장 단계(delete 전), 1.3 janitor 역할 생성 추가
   - 보안 절 신설 (`BLAST_USAGE_REPORT`, EBS 기본 암호화, 프라이빗 서브넷, 사전 생성 IAM 역할 주입)
+  - 1.4 EC2 vCPU 쿼터 사전 확인(384 vCPU, 부족 시 `Pending` 무한 대기), `results` 접두어는 실행마다 새로, `status --wait --exit-code`와 실제 상태 값·출력 형식 반영
+  - 리전 선택 절(서울 단가 약 +20%, 교차 리전 전송 약 $24/노드/실행, c5ad 미제공), 비용 추적 절(`billingcode` 비용 할당 태그 활성화 또는 `labels = Project=BLAST`), 버킷 이름 `elasticblast-<계정 ID>`, `labels`의 `Owner=` 대소문자 주의
 - 2026-10-08: 실행 시간·비용 정정
   - "약 10-11시간, $215-240" → **24분, $11.28** (Cost Explorer·AWS Batch 잡 로그 실측). 이전 수치는 잡 25개의 실행시간 합계를 전체 소요시간으로 읽고 노드 수를 다시 곱한 집계 오류
   - 인스턴스 단가표를 실제 us-east-1 온디맨드 단가로 교체(r5d.24xlarge $6.912, r5ad.24xlarge $6.288)
