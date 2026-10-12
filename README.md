@@ -334,6 +334,7 @@ WARNING: Using gp3 30GB EBS root disk because locally attached SSDs will be used
 elastic-blast status --cfg elasticblast-config.ini
 
 # 완료까지 대기 (20초 간격 폴링) + 종료 코드로 결과 반환 (0 = 성공, 1 = 실패)
+# --wait는 끝날 때까지 아무것도 출력하지 않으므로, 진행 상황은 다른 터미널에서 위 1회 명령으로 확인
 elastic-blast status --cfg elasticblast-config.ini --wait --exit-code \
   && echo "BLAST 성공" || echo "BLAST 실패"
 ```
@@ -449,7 +450,7 @@ wc -l batch_*.out  # 총 매치 수
 
 ### 6.5 실행 요약(run-summary) 저장
 
-`elastic-blast delete`를 실행하기 **전에** 실행 요약을 저장합니다. 노드 수·인스턴스 타입·배치별 실행 시간·DB 다운로드 시간 등이 JSON으로 기록되어 비용 분석과 재현에 쓰입니다.
+`elastic-blast delete`를 실행하기 **전에** 실행 요약을 저장합니다. 배치별 실행 시간·CPU 사용률·DB 다운로드 시간·전체 벽시계 시간이 JSON으로 기록되어 비용 분석과 재현에 쓰입니다. AWS에서는 `clusterInfo`의 인스턴스 타입·대수 필드가 비어 있으므로(1.5.0, 2026-10-12 실행 확인) 설정 파일을 함께 보관해야 노드-시간을 계산할 수 있습니다.
 
 ```bash
 elastic-blast run-summary --cfg elasticblast-config.ini -o run-summary.json
